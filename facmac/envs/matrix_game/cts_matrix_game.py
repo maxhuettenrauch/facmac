@@ -1,5 +1,5 @@
-from envs.multiagentenv import MultiAgentEnv
-from utils.dict2namedtuple import convert
+from facmac.envs.multiagentenv import MultiAgentEnv
+from facmac.utils.dict2namedtuple import convert
 import numpy as np
 from gym.spaces import Box
 

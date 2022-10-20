@@ -3,8 +3,8 @@ import gym
 from gym.spaces import Box
 import numpy as np
 from gym.wrappers import TimeLimit
-from envs.multiagentenv import MultiAgentEnv
-from envs.mamujoco import obsk
+from facmac.envs.multiagentenv import MultiAgentEnv
+from facmac.envs.mamujoco import obsk
 
 
 # using code from https://github.com/ikostrikov/pytorch-ddpg-naf
@@ -78,7 +78,7 @@ class MujocoMulti(MultiAgentEnv):
             try:
                 self.wrapped_env = NormalizedActions(gym.make(self.scenario))
             except gym.error.Error:
-                from envs import REGISTRY as env_REGISTRY
+                from facmac.envs import REGISTRY as env_REGISTRY
                 self.wrapped_env = NormalizedActions(TimeLimit(partial(env_REGISTRY[self.scenario],**kwargs["env_args"])(), max_episode_steps=self.episode_limit))
         else:
             assert False,  "not implemented!"

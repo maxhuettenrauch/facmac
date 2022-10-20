@@ -1,16 +1,14 @@
 import copy
-from components.episode_buffer import EpisodeBatch
-from modules.critics.facmac import FACMACDiscreteCritic
-from components.action_selectors import multinomial_entropy
+from facmac.components.episode_buffer import EpisodeBatch
+from facmac.modules.critics.facmac import FACMACCritic
 import torch as th
 from torch.optim import RMSprop, Adam
-from modules.mixers.vdn import VDNMixer
-from modules.mixers.qmix import QMixer
-from modules.mixers.qmix_ablations import VDNState, QMixerNonmonotonic
-from utils.rl_utils import build_td_lambda_targets
+from facmac.modules.mixers.vdn import VDNMixer
+from facmac.modules.mixers.qmix import QMixer
+from facmac.modules.mixers.qmix_ablations import VDNState, QMixerNonmonotonic
 
 
-class FACMACDiscreteLearner:
+class FACMACLearner:
     def __init__(self, mac, scheme, logger, args):
         self.args = args
         self.n_agents = args.n_agents
@@ -21,9 +19,10 @@ class FACMACDiscreteLearner:
         self.target_mac = copy.deepcopy(self.mac)
         self.agent_params = list(mac.parameters())
 
-        self.critic = FACMACDiscreteCritic(scheme, args)
+        self.critic = FACMACCritic(scheme, args)
         self.target_critic = copy.deepcopy(self.critic)
         self.critic_params = list(self.critic.parameters())
+
         self.mixer = None
         if args.mixer is not None and self.args.n_agents > 1:  # if just 1 agent do not mix anything
             if args.mixer == "vdn":
@@ -54,40 +53,47 @@ class FACMACDiscreteLearner:
             raise Exception("unknown optimizer {}".format(getattr(self.args, "optimizer", "rmsprop")))
 
         self.log_stats_t = -self.args.learner_log_interval - 1
-        self.last_target_update_episode = 0
-        self.critic_training_steps = 0
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
-        # actions = batch["actions"][:, :]
-        actions = batch["actions_onehot"][:, :]
-        terminated = batch["terminated"].float()
-        mask = batch["filled"].float()
+        actions = batch["actions"][:, :-1]
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        avail_actions = batch["avail_actions"][:, :-1]
 
         # Train the critic batched
-        target_mac_out = []
+        target_actions = []
         self.target_mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length):
-            target_act_outs = self.target_mac.select_actions(batch, t_ep=t, t_env=t_env, test_mode=True)
-            target_mac_out.append(target_act_outs)
-        target_mac_out = th.stack(target_mac_out, dim=1)  # Concat over time
+            agent_target_outs = self.target_mac.select_actions(batch, t_ep=t, t_env=None, test_mode=True,
+                                                               critic=self.target_critic, target_mac=True)
+            target_actions.append(agent_target_outs)
+        target_actions = th.stack(target_actions, dim=1)  # Concat over time
 
-        q_taken, _ = self.critic(batch["obs"][:, :-1], actions[:, :-1])
-        if self.mixer is not None:
-            if self.args.mixer == "vdn":
-                q_taken = self.mixer(q_taken.view(-1, self.n_agents, 1), batch["state"][:, :-1])
-            else:
-                q_taken = self.mixer(q_taken.view(batch.batch_size, -1, 1), batch["state"][:, :-1])
+        q_taken = []
+        self.critic.init_hidden(batch.batch_size)
+        for t in range(batch.max_seq_length - 1):
+            inputs = self._build_inputs(batch, t=t)
+            critic_out, self.critic.hidden_states = self.critic(inputs, actions[:, t:t + 1].detach(),
+                                                                self.critic.hidden_states)
+            if self.mixer is not None:
+                critic_out = self.mixer(critic_out.view(batch.batch_size, -1, 1), batch["state"][:, t:t + 1])
+            q_taken.append(critic_out)
+        q_taken = th.stack(q_taken, dim=1)
 
-        target_vals, _ = self.target_critic(batch["obs"][:, :], target_mac_out.detach())
-        if self.mixer is not None:
-            if self.args.mixer == "vdn":
-                target_vals = self.target_mixer(target_vals.view(-1, self.n_agents, 1), batch["state"][:, :])
-            else:
-                target_vals = self.target_mixer(target_vals.view(batch.batch_size, -1, 1), batch["state"][:, :])
+        target_vals = []
+        self.target_critic.init_hidden(batch.batch_size)
+        for t in range(1, batch.max_seq_length):
+            target_inputs = self._build_inputs(batch, t=t)
+            target_critic_out, \
+            self.target_critic.hidden_states = self.target_critic(target_inputs, target_actions[:, t:t+1].detach(),
+                                                                  self.target_critic.hidden_states)
+            if self.mixer is not None:
+                target_critic_out = self.target_mixer(target_critic_out.view(batch.batch_size, -1, 1),
+                                                      batch["state"][:, t:t+1])
+            target_vals.append(target_critic_out)
+        target_vals = th.stack(target_vals, dim=1)
 
         if self.mixer is not None:
             q_taken = q_taken.view(batch.batch_size, -1, 1)
@@ -96,10 +102,8 @@ class FACMACDiscreteLearner:
             q_taken = q_taken.view(batch.batch_size, -1, self.n_agents)
             target_vals = target_vals.view(batch.batch_size, -1, self.n_agents)
 
-        targets = build_td_lambda_targets(batch["reward"], terminated, mask, target_vals, self.n_agents,
-                                          self.args.gamma, self.args.td_lambda)
-        mask = mask[:, :-1]
-        td_error = (q_taken - targets.detach())
+        targets = rewards.expand_as(target_vals) + self.args.gamma * (1 - terminated.expand_as(target_vals)) * target_vals
+        td_error = (targets.detach() - q_taken)
         mask = mask.expand_as(td_error)
         masked_td_error = td_error * mask
         loss = (masked_td_error ** 2).sum() / mask.sum()
@@ -108,30 +112,29 @@ class FACMACDiscreteLearner:
         loss.backward()
         critic_grad_norm = th.nn.utils.clip_grad_norm_(self.critic_params, self.args.grad_norm_clip)
         self.critic_optimiser.step()
-        self.critic_training_steps += 1
 
         # Train the actor
-        # Use gumbel softmax to reparameterize the stochastic policies as deterministic functions of independent
-        # noise to compute the policy gradient (one hot action input to the critic)
+        # Optimize over the entire joint action space
         mac_out = []
+        chosen_action_qvals = []
         self.mac.init_hidden(batch.batch_size)
-        for t in range(batch.max_seq_length - 1):
-            act_outs = self.mac.select_actions(batch, t_ep=t, t_env=t_env, test_mode=False, explore=False)
-            mac_out.append(act_outs)
-        mac_out = th.stack(mac_out, dim=1)  # Concat over time
-        chosen_action_qvals, _ = self.critic(batch["obs"][:, :-1], mac_out)
-
-        if self.mixer is not None:
-            if self.args.mixer == "vdn":
-                chosen_action_qvals = self.mixer(chosen_action_qvals.view(-1, self.n_agents, 1),
-                                                 batch["state"][:, :-1])
-                chosen_action_qvals = chosen_action_qvals.view(batch.batch_size, -1, 1)
-            else:
-                chosen_action_qvals = self.mixer(chosen_action_qvals.view(batch.batch_size, -1, 1),
-                                                 batch["state"][:, :-1])
-
+        self.critic.init_hidden(batch.batch_size)
+        for t in range(batch.max_seq_length):
+            agent_outs = self.mac.forward(batch, t=t, select_actions=True)["actions"].view(batch.batch_size,
+                                                                                           self.n_agents,
+                                                                                           self.n_actions)
+            q, self.critic.hidden_states = self.critic(self._build_inputs(batch, t=t), agent_outs,
+                                                       self.critic.hidden_states)
+            if self.mixer is not None:
+                q = self.mixer(q.view(batch.batch_size, -1, 1), batch["state"][:, t:t+1])
+            mac_out.append(agent_outs)
+            chosen_action_qvals.append(q)
+        mac_out = th.stack(mac_out[:-1], dim=1)
+        chosen_action_qvals = th.stack(chosen_action_qvals[:-1], dim=1)
+        pi = mac_out
+        
         # Compute the actor loss
-        pg_loss = - (chosen_action_qvals * mask).sum() / mask.sum()
+        pg_loss = -chosen_action_qvals.mean() + (pi**2).mean() * 1e-3
 
         # Optimise agents
         self.agent_optimiser.zero_grad()
@@ -140,9 +143,7 @@ class FACMACDiscreteLearner:
         self.agent_optimiser.step()
 
         if getattr(self.args, "target_update_mode", "hard") == "hard":
-            if (self.critic_training_steps - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
-                self._update_targets()
-                self.last_target_update_episode = self.critic_training_steps
+            self._update_targets()
         elif getattr(self.args, "target_update_mode", "hard") in ["soft", "exponential_moving_average"]:
             self._update_targets_soft(tau=getattr(self.args, "target_update_tau", 0.001))
         else:
@@ -153,9 +154,9 @@ class FACMACDiscreteLearner:
             self.logger.log_stat("critic_loss", loss.item(), t_env)
             self.logger.log_stat("critic_grad_norm", critic_grad_norm, t_env)
             mask_elems = mask.sum().item()
-            self.logger.log_stat("td_error_abs", masked_td_error.abs().sum().item() / mask_elems, t_env)
-            self.logger.log_stat("target_mean", (targets * mask).sum().item() / (mask_elems * self.args.n_agents),
-                                 t_env)
+            self.logger.log_stat("target_mean", targets.sum().item() / mask_elems, t_env)
+            self.logger.log_stat("pg_loss", pg_loss.item(), t_env)
+            self.logger.log_stat("agent_grad_norm", agent_grad_norm, t_env)
             self.log_stats_t = t_env
 
     def _update_targets_soft(self, tau):
@@ -171,6 +172,26 @@ class FACMACDiscreteLearner:
 
         if self.args.verbose:
             self.logger.console_logger.info("Updated all target networks (soft update tau={})".format(tau))
+
+    def _build_inputs(self, batch, t):
+        bs = batch.batch_size
+        inputs = []
+
+        if self.args.recurrent_critic:
+            # The individual Q conditions on the global action-observation history and individual action
+            inputs.append(batch["obs"][:, t].repeat(1, self.args.n_agents, 1).view(bs, self.args.n_agents, -1))
+            if self.args.obs_last_action:
+                if t == 0:
+                    inputs.append(th.zeros_like(batch["actions"][:, t].repeat(1, self.args.n_agents, 1).
+                                                view(bs, self.args.n_agents, -1)))
+                else:
+                    inputs.append(batch["actions"][:, t - 1].repeat(1, self.args.n_agents, 1).
+                                  view(bs, self.args.n_agents, -1))
+        else:
+            inputs.append(batch["obs"][:, t])
+
+        inputs = th.cat([x.reshape(bs * self.n_agents, -1) for x in inputs], dim=1)
+        return inputs
 
     def _update_targets(self):
         self.target_mac.load_state(self.mac)

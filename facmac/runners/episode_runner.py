@@ -1,6 +1,6 @@
-from envs import REGISTRY as env_REGISTRY
+from facmac.envs import REGISTRY as env_REGISTRY
 from functools import partial
-from components.episode_buffer import EpisodeBatch
+from facmac.components.episode_buffer import EpisodeBatch
 import torch as th
 import numpy as np
 import copy
@@ -10,16 +10,19 @@ import random
 
 class EpisodeRunner:
 
-    def __init__(self, args, logger):
+    def __init__(self, args, logger, env=None):
         self.args = args
         self.logger = logger
         self.batch_size = self.args.batch_size_run
         assert self.batch_size == 1
 
-        if 'sc2' in self.args.env:
-            self.env = env_REGISTRY[self.args.env](**self.args.env_args)
+        if env is None:
+            if 'sc2' in self.args.env:
+                self.env = env_REGISTRY[self.args.env](**self.args.env_args)
+            else:
+                self.env = env_REGISTRY[self.args.env](env_args=self.args.env_args, args=args)
         else:
-            self.env = env_REGISTRY[self.args.env](env_args=self.args.env_args, args=args)
+            self.env = env
 
         self.episode_limit = self.env.episode_limit
         self.t = 0

@@ -3,7 +3,7 @@ import gym
 from gym import spaces
 from gym.envs.registration import EnvSpec
 import numpy as np
-from envs.particle.multi_discrete import MultiDiscrete
+from facmac.envs.particle.multi_discrete import MultiDiscrete
 
 
 # environment for all agents in the multiagent world
