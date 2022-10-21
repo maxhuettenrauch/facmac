@@ -99,7 +99,11 @@ class MujocoMulti(MultiAgentEnv):
 
     def step(self, actions):
         flat_actions = np.concatenate([actions[i][:self.action_space[i].low.shape[0]] for i in range(self.n_agents)])
-        obs_n, reward_n, done_n, info_n = self.wrapped_env.step(flat_actions)
+        try:
+            obs_n, reward_n, done_n, info_n = self.wrapped_env.step(flat_actions)
+        except ValueError:
+            obs_n, reward_n, done, truncated, info_n = self.wrapped_env.step(flat_actions)
+            done_n = done or truncated
         self.steps += 1
 
         info = {}
@@ -139,7 +143,7 @@ class MujocoMulti(MultiAgentEnv):
             return max([len(self.get_obs_agent(agent_id)) for agent_id in range(self.n_agents)])
 
     def get_state(self, team=None):
-        return self.env._get_obs()
+        return self.env.unwrapped._get_obs()
 
     def get_state_size(self):
         """ Returns the shape of the state"""
